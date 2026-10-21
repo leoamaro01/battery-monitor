@@ -30,6 +30,20 @@ pio run -e simulator -t exec                       # window; cycles through fake
 .pio/build/simulator/program --snapshot shots/     # render each page to shots/pageN.bmp, no window
 ```
 
+### Real data in the simulator
+
+```sh
+.pio/build/simulator/program --live              # real weather + real batteries
+.pio/build/simulator/program --live-weather      # real weather, fake batteries
+.pio/build/simulator/program --live-batteries    # real batteries, fake weather
+```
+
+Run these from the project root. Weather comes from Open-Meteo via `curl`. Batteries are read by
+`uv run tools/jbd_monitor.py --json`, which handles Bluetooth on the desktop and hands the raw BMS
+replies to the simulator, where the same C++ parser as the firmware decodes them. Close the
+Eco-Worthy app first; the batteries take only one connection. `--bridge CMD` swaps in another
+command that prints the same JSON lines.
+
 Drag with the mouse to swipe between pages. The screen goes black after `SCREEN_SLEEP_MS` without
 input; click to wake.
 

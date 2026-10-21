@@ -3,6 +3,7 @@
 //   pio run -e simulator -t exec                              (cycles through scenarios every 20 s)
 //   .pio/build/simulator/program --scenario 2                 (stick to one scenario)
 //   .pio/build/simulator/program --snapshot out/ --scenario 1 (render each page to out/pageN.bmp, no window)
+//   .pio/build/simulator/program --live                       (real weather + real batteries, see live.h)
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -17,6 +18,7 @@
 #include "../../core/state.h"
 #include "../../core/weather.h"
 #include "../../ui/ui.h"
+#include "live.h"
 
 // ---------------------------------------------------------------- platform hooks
 
@@ -70,13 +72,19 @@ static void loadCaptured(BatteryState &b, int index) {
     }
 }
 
+static bool g_liveWeather = false, g_liveBatteries = false;
+
 static void updateFakeData(int scenario, uint32_t now) {
     std::lock_guard<std::mutex> lock(g_stateMutex);
     AppState &s = g_state;
-    s.wifiConnected = true;
     s.timeValid = true;
-    if (!s.weather.valid)
-        weather::parse(SAMPLE_WEATHER, strlen(SAMPLE_WEATHER), s.weather);
+    if (!g_liveWeather) {
+        s.wifiConnected = true;
+        if (!s.weather.valid)
+            weather::parse(SAMPLE_WEATHER, strlen(SAMPLE_WEATHER), s.weather);
+    }
+    if (g_liveBatteries)
+        return;
 
     float wobble = sinf(now / 3000.0f); // gentle movement so you can see the UI update
     for (int i = 0; i < BATTERY_COUNT; i++) {
@@ -145,12 +153,33 @@ static bool writeBmp(const std::string &path, const lv_draw_buf_t *buf) {
     return true;
 }
 
-static int runSnapshots(const std::string &dir, int scenario) {
+// With --live, wait (up to a minute) until the live sources have delivered something.
+static void waitForLiveData() {
+    for (int i = 0; i < 600; i++) {
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            bool ready = !g_liveWeather || g_state.weather.valid;
+            for (const auto &b : g_state.batteries)
+                ready &= !g_liveBatteries || b.valid;
+            if (ready)
+                return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    fprintf(stderr, "live data incomplete after 60 s; rendering what arrived\n");
+}
+
+static int runSnapshots(const std::string &dir, int scenario, const char *bridge) {
     static uint8_t fb[480 * 48 * 2];
     lv_display_t *disp = lv_display_create(480, 480);
     lv_display_set_buffers(disp, fb, nullptr, sizeof fb, LV_DISPLAY_RENDER_MODE_PARTIAL);
     lv_display_set_flush_cb(disp, [](lv_display_t *d, const lv_area_t *, uint8_t *) { lv_display_flush_ready(d); });
 
+    if (g_liveWeather)
+        live_weather_start();
+    if (g_liveBatteries)
+        live_batteries_start(bridge);
+    waitForLiveData();
     updateFakeData(scenario, platform_millis());
     ui_init();
     for (int page = 0; page < 3; page++) {
@@ -173,13 +202,28 @@ static int runSnapshots(const std::string &dir, int scenario) {
 int main(int argc, char **argv) {
     int scenario = -1; // -1 = cycle
     const char *snapshotDir = nullptr;
+    const char *bridge = "uv run tools/jbd_monitor.py --json";
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--scenario") && i + 1 < argc)
             scenario = atoi(argv[++i]) % SCENARIO_COUNT;
         else if (!strcmp(argv[i], "--snapshot") && i + 1 < argc)
             snapshotDir = argv[++i];
+        else if (!strcmp(argv[i], "--live"))
+            g_liveWeather = g_liveBatteries = true;
+        else if (!strcmp(argv[i], "--live-weather"))
+            g_liveWeather = true;
+        else if (!strcmp(argv[i], "--live-batteries"))
+            g_liveBatteries = true;
+        else if (!strcmp(argv[i], "--bridge") && i + 1 < argc)
+            bridge = argv[++i];
         else {
-            fprintf(stderr, "usage: %s [--scenario 0-%d] [--snapshot DIR]\n", argv[0], SCENARIO_COUNT - 1);
+            fprintf(stderr,
+                    "usage: %s [--scenario 0-%d] [--snapshot DIR] [--live | --live-weather | --live-batteries]\n"
+                    "          [--bridge CMD]\n\n"
+                    "  --live-weather    fetch real weather with curl\n"
+                    "  --live-batteries  read the real batteries through CMD (default: %s),\n"
+                    "                    run from the project root\n\n",
+                    argv[0], SCENARIO_COUNT - 1, bridge);
             for (int s = 0; s < SCENARIO_COUNT; s++)
                 fprintf(stderr, "  scenario %d: %s\n", s, SCENARIOS[s]);
             return 2;
@@ -189,10 +233,14 @@ int main(int argc, char **argv) {
     lv_init();
     lv_tick_set_cb(platform_millis);
     if (snapshotDir)
-        return runSnapshots(snapshotDir, scenario < 0 ? 0 : scenario);
+        return runSnapshots(snapshotDir, scenario < 0 ? 0 : scenario, bridge);
 
     lv_sdl_window_create(480, 480);
     lv_sdl_mouse_create();
+    if (g_liveWeather)
+        live_weather_start();
+    if (g_liveBatteries)
+        live_batteries_start(bridge);
     updateFakeData(scenario < 0 ? 0 : scenario, platform_millis());
     ui_init();
 
@@ -202,7 +250,7 @@ int main(int argc, char **argv) {
         uint32_t now = platform_millis();
         if (now - lastData >= 1000) {
             int active = scenario >= 0 ? scenario : int(now / 20000) % SCENARIO_COUNT;
-            if (active != shown) {
+            if (active != shown && !g_liveBatteries) {
                 printf("[sim] scenario %d: %s\n", active, SCENARIOS[active]);
                 shown = active;
             }

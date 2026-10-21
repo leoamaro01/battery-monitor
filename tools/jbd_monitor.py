@@ -7,6 +7,7 @@
 Run with:  uv run jbd_monitor.py            (scan, connect, poll every 5 s)
            uv run jbd_monitor.py --scan     (just list matching batteries)
            uv run jbd_monitor.py --once     (single reading, then exit)
+           uv run jbd_monitor.py --json     (one JSON line per battery per poll, for the simulator)
 
 Only read commands (0x03, 0x04) are ever sent. Nothing is written to the BMS.
 """
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import sys
 from dataclasses import dataclass, field
@@ -141,6 +143,9 @@ class Battery:
     info: BasicInfo | None = None
     cells: list[float] = field(default_factory=list)
     error: str | None = None
+    # Last raw reply payloads, passed on as-is in --json mode.
+    basic_raw: bytes | None = None
+    cells_raw: bytes | None = None
 
     def __post_init__(self) -> None:
         self.client = BleakClient(self.device, disconnected_callback=self._on_disconnect)
@@ -186,13 +191,24 @@ class Battery:
         try:
             await self.connect()
             step = "basic info"
-            self.info = BasicInfo.parse(await self.request(CMD_BASIC_INFO))
+            self.basic_raw = await self.request(CMD_BASIC_INFO)
+            self.info = BasicInfo.parse(self.basic_raw)
             step = "cell voltages"
-            self.cells = parse_cells(await self.request(CMD_CELL_VOLTAGES))
+            self.cells_raw = await self.request(CMD_CELL_VOLTAGES)
+            self.cells = parse_cells(self.cells_raw)
             self.error = None
         except Exception as e:  # keep polling the other battery; reconnect next round
             self.error = f"{step} failed: {type(e).__name__}" + (f": {e}" if str(e) else "")
             self.assembler = FrameAssembler()
+
+    def to_json(self) -> str:
+        return json.dumps({
+            "label": self.label,
+            "address": self.device.address,
+            "basic": self.basic_raw.hex() if self.basic_raw else None,
+            "cells": self.cells_raw.hex() if self.cells_raw else None,
+            "error": self.error,
+        })
 
     async def close(self) -> None:
         if self.client.is_connected:
@@ -285,9 +301,11 @@ async def main() -> int:
     p.add_argument("--scan-timeout", type=float, default=20)
     p.add_argument("--scan", action="store_true", help="list matching batteries and exit")
     p.add_argument("--once", action="store_true", help="take one reading and exit")
+    p.add_argument("--json", action="store_true", help="print one JSON line per battery per poll (raw payloads)")
     args = p.parse_args()
+    log = sys.stderr if args.json else sys.stdout
 
-    print(f"Scanning for {args.count} × '{args.name}*' (close the Eco-Worthy app and nRF Connect)…")
+    print(f"Scanning for {args.count} × '{args.name}*' (close the Eco-Worthy app and nRF Connect)…", file=log)
     devices = await discover(args.name, args.count, args.scan_timeout)
     if args.scan:
         for d in devices:
@@ -310,9 +328,13 @@ async def main() -> int:
         for label, b in zip("ABCDEFGH", batteries):
             b.label = label
         while True:
-            if not args.once:
-                os.system("cls" if os.name == "nt" else "clear")
-            print(render(batteries))
+            if args.json:
+                for b in batteries:
+                    print(b.to_json(), flush=True)
+            else:
+                if not args.once:
+                    os.system("cls" if os.name == "nt" else "clear")
+                print(render(batteries))
             if args.once:
                 return 0
             await asyncio.sleep(args.interval)
@@ -324,5 +346,5 @@ async def main() -> int:
 if __name__ == "__main__":
     try:
         sys.exit(asyncio.run(main()))
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, BrokenPipeError):  # BrokenPipe: the simulator reading --json closed
         pass
